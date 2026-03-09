@@ -19,6 +19,7 @@ from .distributed import DistributedDataParallel
 from .bert_model import BertModel
 from .gpt_model import GPTModel, GPTModelPipe
 from .diff_gpt_model import DiffGPTModel, DiffGPTModelPipe
+from .ebt_gpt_model import EBTGPTModel
 from .target_gpt_model import TargetGPTModel, TargetGPTModelPipe
 from .t5_model import T5Model
 from .language_model import get_language_model

@@ -564,6 +564,39 @@ def _add_extra_args(parser):
     
     group.add_argument('--untie-with-additional-mask', action='store_true',
                        help='Untie the embeddings and add additional mask token (will make tensor parallel not work)')
+
+    # EBT (Energy-Based Transformer) arguments
+    group.add_argument('--ebt-num-mcmc-steps', type=int, default=3,
+                       help='Number of MCMC optimization steps for EBT.')
+    group.add_argument('--ebt-step-size', type=float, default=500.0,
+                       help='MCMC step size (alpha) for EBT.')
+    group.add_argument('--ebt-step-size-learnable', action='store_true', default=False,
+                       help='Make EBT step size learnable.')
+    group.add_argument('--ebt-truncate-mcmc', action='store_true', default=True,
+                       help='Only backprop through final MCMC step.')
+    group.add_argument('--ebt-normalize-predictions', action='store_true', default=True,
+                       help='Apply softmax before vocab_to_embed.')
+    group.add_argument('--ebt-vocab-to-embed-method', type=str, default='linear',
+                       choices=['linear', 'weighted_sum'],
+                       help='Method to convert logits to embeddings.')
+    group.add_argument('--ebt-langevin-noise', type=float, default=0.0,
+                       help='Langevin dynamics noise std (0=disabled).')
+    group.add_argument('--ebt-randomize-step-size-scale', type=float, default=1.0,
+                       help='Randomize step size by this factor (1.0=disabled).')
+    group.add_argument('--ebt-randomize-num-steps', type=int, default=0,
+                       help='Max additional random MCMC steps (0=disabled).')
+    group.add_argument('--ebt-pred-rmsnorm', action='store_true', default=False,
+                       help='Apply RMSNorm to predictions between MCMC steps.')
+    group.add_argument('--ebt-fp32', action='store_true', default=True,
+                       help='Run entire EBT in fp32 (default). Second-order gradients '
+                       'through MCMC lose precision in bf16. Use --no-ebt-fp32 with '
+                       '--bf16 for hybrid mode (experimental).')
+    group.add_argument('--no-ebt-fp32', dest='ebt_fp32', action='store_false',
+                       help='Disable fp32 mode, use hybrid bf16 instead.')
+    group.add_argument('--ebt-use-mask-token', action='store_true', default=False,
+                       help='Initialize MCMC from mask token embeddings instead of random '
+                       'logits. MCMC refines in embedding space, then a linear layer '
+                       'maps refined embeddings to logits for the loss.')
     return parser
 
 def _add_transformer_engine_args(parser):
@@ -758,6 +791,8 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
+    group.add_argument('--log-grad-stats', action='store_true',
+                       help='If set, log per-module gradient norms to tensorboard/wandb.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--timing-log-level', type=int,
@@ -1183,6 +1218,10 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--keep-best-n-checkpoints', type=int, default=None,
+                       help='Keep only the N checkpoints with lowest validation loss. '
+                       'Saves after each eval and encodes val loss in the directory name. '
+                       'Deletes the worst checkpoint when more than N exist.')
     group.add_argument('--no-initialization', action='store_false',
                        help='Do not perform initialization when building model, '
                        'can reduce startup time when definitely loading from a '
@@ -1324,6 +1363,11 @@ def _add_validation_args(parser):
 
     group.add_argument('--num-mc', type=int, default=1,
                        help='Number of Monte Carlo samples for evaluation.')
+    group.add_argument('--online-eval-tasks', type=str, default=None,
+                       help='Comma-separated list of lm-eval-harness tasks to '
+                       'run during training (e.g. "lambada_standard,hellaswag").')
+    group.add_argument('--online-eval-interval', type=int, default=None,
+                       help='Interval for online lm-eval. Defaults to eval-interval.')
     return parser
 
 

@@ -8,6 +8,8 @@ import math
 import sys
 import time
 import json
+import os
+import shutil
 try:
     import wandb
 except (ImportError, ModuleNotFoundError):
@@ -22,6 +24,7 @@ from enum import Enum
 from megatron import get_args
 from megatron import get_signal_handler
 from megatron import get_timers
+from megatron import get_tokenizer
 from megatron import get_tensorboard_writer
 from megatron import get_wandb_writer
 from megatron import get_current_global_batch_size
@@ -744,6 +747,22 @@ def train_step(forward_step_func, data_iterator,
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    # Log per-module gradient stats (before optimizer step clears grads).
+    grad_stats = {}
+    if args.log_grad_stats:
+        unwrapped = unwrap_model(model[0],
+                                 (torchDDP, LocalDDP, Float16Module))
+        module_grad_sq = {}
+        for name, param in unwrapped.named_parameters():
+            if param.grad is None:
+                continue
+            # Group by top-level module name
+            top = name.split('.')[0]
+            grad_sq = param.grad.float().norm().item() ** 2
+            module_grad_sq[top] = module_grad_sq.get(top, 0.0) + grad_sq
+        for top, sq in module_grad_sq.items():
+            grad_stats[f'grad-norm/{top}'] = sq ** 0.5
+
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.deepspeed:
@@ -776,6 +795,7 @@ def train_step(forward_step_func, data_iterator,
         for key in losses_reduced[0]:
             losses_reduced_for_key = [x[key] for x in losses_reduced]
             loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+        loss_reduced.update(grad_stats)
         return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
     else:
         if update_successful:
@@ -797,6 +817,7 @@ def train_step(forward_step_func, data_iterator,
             for key in losses_reduced[0]:
                 losses_reduced_for_key = [x[key] for x in losses_reduced]
                 loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+            loss_reduced.update(grad_stats)
             return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
@@ -1221,6 +1242,81 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers.log(['save-checkpoint'])
 
 
+def _best_ckpt_tracker_path(save_dir):
+    return os.path.join(save_dir, 'best_checkpoints.json')
+
+
+def _save_best_checkpoint(iteration, val_loss, model, optimizer, opt_param_scheduler):
+    """Save checkpoint and prune if we exceed --keep-best-n-checkpoints."""
+    args = get_args()
+    n = args.keep_best_n_checkpoints
+    tracker_path = _best_ckpt_tracker_path(args.save)
+
+    # Load existing tracker
+    tracker = {}  # {iteration_str: val_loss}
+    if is_rank_0() and os.path.exists(tracker_path):
+        with open(tracker_path, 'r') as f:
+            tracker = json.load(f)
+
+    # Broadcast decision to all ranks: should we save?
+    should_save = True
+    iter_to_delete = None
+    if is_rank_0():
+        if len(tracker) < n:
+            should_save = True
+        else:
+            worst_iter = max(tracker, key=lambda k: tracker[k])
+            if val_loss < tracker[worst_iter]:
+                should_save = True
+                iter_to_delete = worst_iter
+            else:
+                should_save = False
+
+    if torch.distributed.is_initialized():
+        flag = torch.tensor([1 if should_save else 0],
+                            device=get_accelerator().current_device_name())
+        torch.distributed.broadcast(flag, src=0)
+        should_save = flag.item() == 1
+
+        del_flag = torch.tensor([int(iter_to_delete) if iter_to_delete is not None else -1],
+                                device=get_accelerator().current_device_name())
+        torch.distributed.broadcast(del_flag, src=0)
+        iter_to_delete = str(del_flag.item()) if del_flag.item() >= 0 else None
+
+    if not should_save:
+        print_rank_0(f'  > skipping checkpoint at iteration {iteration} '
+                     f'(val loss {val_loss:.4f} not in top {n})')
+        return
+
+    # Save the new checkpoint
+    save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler)
+
+    # Update tracker and delete worst checkpoint (rank 0 only)
+    if is_rank_0():
+        if iter_to_delete is not None and iter_to_delete in tracker:
+            # Delete the worst checkpoint directory
+            del_iteration = int(iter_to_delete)
+            # Try DeepSpeed format (global_stepXXXX)
+            ds_dir = os.path.join(args.save, f'global_step{del_iteration}')
+            # Try Megatron format (iter_XXXXXXX)
+            meg_dir = os.path.join(args.save, f'iter_{del_iteration:07d}')
+            for d in [ds_dir, meg_dir]:
+                if os.path.isdir(d):
+                    shutil.rmtree(d)
+                    print_rank_0(f'  > deleted checkpoint {d} '
+                                 f'(val loss {tracker[iter_to_delete]:.4f})')
+            del tracker[iter_to_delete]
+
+        tracker[str(iteration)] = val_loss
+        os.makedirs(args.save, exist_ok=True)
+        with open(tracker_path, 'w') as f:
+            json.dump(tracker, f, indent=2)
+        print_rank_0(f'  > best checkpoints: '
+                     + ', '.join(f'iter {k} (loss {v:.4f})'
+                                 for k, v in sorted(tracker.items(),
+                                                    key=lambda x: x[1])))
+
+
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
           process_non_loss_data_func):
@@ -1344,13 +1440,20 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                               opt_param_scheduler)
 
         # Evaluation
+        val_loss = None
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
             prefix = 'iteration {}'.format(iteration)
-            evaluate_and_print_results(prefix, forward_step_func,
+            val_loss = evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, False)
+
+        # Online LM-eval-harness evaluation
+        online_eval_interval = args.online_eval_interval or args.eval_interval
+        if args.online_eval_tasks and online_eval_interval and \
+           iteration % online_eval_interval == 0:
+            _run_online_eval(model, iteration, args)
 
         # Checkpointing
         saved_checkpoint = False
@@ -1362,8 +1465,16 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 print_datetime('exiting program after receiving SIGTERM.')
                 sys.exit()
 
+        # Best-N checkpoint saving (triggered by eval, not save_interval)
+        if args.save and args.keep_best_n_checkpoints and val_loss is not None:
+            _save_best_checkpoint(iteration, val_loss, model, optimizer,
+                                  opt_param_scheduler)
+            saved_checkpoint = True
+
+        # Regular interval checkpoint saving (skip if best-N already handled it)
         if args.save and args.save_interval and \
-           iteration % args.save_interval == 0:
+           iteration % args.save_interval == 0 and \
+           not (args.keep_best_n_checkpoints and val_loss is not None):
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler)
             saved_checkpoint = True
@@ -1513,6 +1624,68 @@ def evaluate(forward_step_func,
 
     return total_loss_dict, collected_non_loss_data
 
+def _run_online_eval(model, iteration, args):
+    """Run lm-eval-harness tasks and log results to WandB/TensorBoard."""
+    try:
+        from lm_eval import evaluator, tasks as lm_tasks
+        from tasks.eval_harness.evaluate import EvalHarnessAdaptor
+    except ImportError as e:
+        print_rank_0(f"Skipping online eval: {e}")
+        return
+
+    if not is_rank_0():
+        return
+
+    task_list = [t.strip() for t in args.online_eval_tasks.split(',')]
+    print_rank_0(f"Running online LM-eval at iteration {iteration}: {task_list}")
+
+    tokenizer = get_tokenizer()
+
+    try:
+        # Set defaults for eval harness args not in training config
+        if not hasattr(args, 'adaptive_seq_len'):
+            args.adaptive_seq_len = False
+        old_no_pp = args.no_pipeline_parallel
+        args.no_pipeline_parallel = True
+
+        # Unwrap DeepSpeed engine for eval
+        ds_engine = model[0] if isinstance(model, list) else model
+        adaptor = EvalHarnessAdaptor(ds_engine, tokenizer)
+        results = evaluator.evaluate(adaptor, lm_tasks.get_task_dict(task_list))
+
+        writer = get_wandb_writer()
+        for task_name, task_results in results['results'].items():
+            for metric_name, metric_value in task_results.items():
+                if isinstance(metric_value, (int, float)):
+                    log_key = f'downstream/{task_name}/{metric_name}'
+                    print_rank_0(f"  {log_key}: {metric_value:.4f}")
+                    if writer:
+                        writer.log({log_key: metric_value}, step=iteration)
+
+        tb_writer = get_tensorboard_writer()
+        if tb_writer:
+            for task_name, task_results in results['results'].items():
+                for metric_name, metric_value in task_results.items():
+                    if isinstance(metric_value, (int, float)):
+                        tb_writer.add_scalar(
+                            f'downstream/{task_name}/{metric_name}',
+                            metric_value, iteration)
+
+    except Exception as e:
+        print_rank_0(f"Online eval failed at iteration {iteration}: {e}")
+        import traceback
+        print_rank_0(traceback.format_exc())
+    finally:
+        args.no_pipeline_parallel = old_no_pp
+
+    # Ensure model is back in train mode
+    if isinstance(model, list):
+        for m in model:
+            m.train()
+    else:
+        model.train()
+
+
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
                                iteration, process_non_loss_data_func, config,
@@ -1592,6 +1765,12 @@ def evaluate_and_print_results(prefix, forward_step_func,
     print_rank_0(f"Resetting randmask_ratio to {old_randmask_ratio} for evaluation")
     print_rank_0(f"Resetting ar_ratio to {old_ar_ratio} for evaluation")
     print_rank_0(f"Resetting use_order_list to {old_use_order_list} for evaluation")
+
+    # Return the primary validation loss value for checkpoint management
+    val_loss = None
+    if 'lm loss' in total_loss_dict:
+        val_loss = total_loss_dict['lm loss'].item()
+    return val_loss
 
 
 def cyclic_iter(iter):
