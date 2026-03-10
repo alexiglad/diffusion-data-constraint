@@ -126,6 +126,12 @@ class EBTGPTModel(MegatronModule):
         if args.use_rotary_position_embeddings:
             rotary_pos_emb = self.language_model.rotary_pos_emb(embeddings.shape[1])
 
+        # Cast encoder_input to the encoder's parameter dtype (e.g. bf16 in hybrid mode).
+        # The MCMC step passes fp32 embeddings (for gradient stability), but the encoder
+        # weights may be bf16. The cast is differentiable so second-order gradients still flow.
+        encoder_param_dtype = next(self.language_model.encoder.parameters()).dtype
+        encoder_input = encoder_input.to(encoder_param_dtype)
+
         # Run encoder (final_layernorm is applied inside when post_process=True)
         encoder_output, *moe_losses = self.language_model.encoder(
             encoder_input,

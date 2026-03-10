@@ -371,7 +371,7 @@ def validate_args(args, defaults={}):
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
-        assert args.save_interval is not None
+        assert args.save_interval is not None or args.keep_best_n_checkpoints is not None
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'

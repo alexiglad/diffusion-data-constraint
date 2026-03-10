@@ -385,8 +385,10 @@ def forward_step(data_iterator, model):
                     model_module, predicted_embeds, real_embeddings, masked_indices,
                     position_ids, attention_mask, alpha, step_idx, num_steps, args)
 
-        # Map refined embeddings to logits via embed_to_vocab
-        predicted_logits = model_module.embed_to_vocab(predicted_embeds.float())
+        # Map refined embeddings to logits via embed_to_vocab.
+        # Cast to weight dtype first (handles bf16 hybrid mode), then back to fp32.
+        embed_dtype = model_module.embed_to_vocab.weight.dtype
+        predicted_logits = model_module.embed_to_vocab(predicted_embeds.to(embed_dtype)).float()
     else:
         # === Logit-space MCMC mode (original) ===
         predicted_logits = torch.randn(
