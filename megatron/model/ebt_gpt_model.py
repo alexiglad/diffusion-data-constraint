@@ -64,7 +64,7 @@ class EBTGPTModel(MegatronModule):
 
         # Energy head: maps hidden states to scalar energy per position
         self.energy_head = nn.Linear(args.hidden_size, 1, bias=False)
-        nn.init.xavier_uniform_(self.energy_head.weight)
+        init_method_normal(args.init_method_std)(self.energy_head.weight)
 
         self.ebt_weight_tie = getattr(args, 'ebt_weight_tie', False)
 
@@ -72,7 +72,7 @@ class EBTGPTModel(MegatronModule):
         vocab_size = args.padded_vocab_size
         if args.ebt_vocab_to_embed_method == 'linear' and not self.ebt_weight_tie:
             self.vocab_to_embed = nn.Linear(vocab_size, args.hidden_size, bias=False)
-            nn.init.xavier_uniform_(self.vocab_to_embed.weight)
+            init_method_normal(args.init_method_std)(self.vocab_to_embed.weight)
         else:
             # weighted_sum mode, or weight-tied (uses word_emb.weight directly)
             self.vocab_to_embed = None
@@ -82,7 +82,7 @@ class EBTGPTModel(MegatronModule):
         # When weight-tied, no separate parameter — uses word_emb.weight directly.
         if args.ebt_use_mask_token and not self.ebt_weight_tie:
             self.embed_to_vocab = nn.Linear(args.hidden_size, vocab_size, bias=False)
-            nn.init.xavier_uniform_(self.embed_to_vocab.weight)
+            init_method_normal(args.init_method_std)(self.embed_to_vocab.weight)
         else:
             self.embed_to_vocab = None
 

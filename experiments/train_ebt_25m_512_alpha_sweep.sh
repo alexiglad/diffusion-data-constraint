@@ -9,7 +9,7 @@
 #SBATCH --time=72:00:00
 #SBATCH --output=output/logs/ebt_alpha_%A_%a.out
 #SBATCH --error=output/logs/ebt_alpha_%A_%a.err
-#SBATCH --array=0-3
+#SBATCH --array=2
 
 module load cuda/12.4.1-fasrc01 gcc/12.2.0-fasrc01
 source ~/miniconda3/etc/profile.d/conda.sh
@@ -32,7 +32,7 @@ NHEADS=${MODEL_PARAM[3]}
 NLAYERS=${MODEL_PARAM[4]}
 SIZE=74M
 
-VARIANT=ebt_25m_512_${SIZE}_alpha${STEP_SIZE}_500ep
+VARIANT=ebt_25m_512_2_mcmc_bf_rms_after_wt_better_init_longer_warm_beta2_0.999_${SIZE}_alpha${STEP_SIZE}_500ep
 echo "Running variant: $VARIANT"
 
 CHECKPOINT_PATH=output/checkpoints_$VARIANT
@@ -52,7 +52,7 @@ PP_SIZE=1
 TP_SIZE=1
 
 SEQ_LEN=512
-MICRO_BATCH_SIZE=16
+MICRO_BATCH_SIZE=32
 GLOBAL_BATCH_SIZE=256
 
 source utils/epoch_tokens.sh
@@ -67,13 +67,13 @@ LOG_INTERVAL=10
 EVAL_ITERS=10
 
 TRAIN_SAMPLES=$((DATA_CNT*EPOCH_CNT/SEQ_LEN))
-WARMUP_SAMPLES=$((TRAIN_SAMPLES/100))
+WARMUP_SAMPLES=$((TRAIN_SAMPLES/10))
 echo "Training samples: $TRAIN_SAMPLES, Epochs: $EPOCH_CNT, Data: $DATA_CNT"
 
 OPTIMIZER_ARGS=" \
     --optimizer adam \
     --adam-beta1 0.9 \
-    --adam-beta2 0.95 \
+    --adam-beta2 0.999 \
     --adam-eps 1e-8 \
     --lr 2e-4 \
     --min-lr 2e-5 \
@@ -86,7 +86,7 @@ OPTIMIZER_ARGS=" \
     "
 
 EBT_ARGS=" \
-    --ebt-num-mcmc-steps 3 \
+    --ebt-num-mcmc-steps 2 \
     --ebt-step-size $STEP_SIZE \
     --ebt-vocab-to-embed-method linear \
     --ebt-normalize-predictions \
@@ -94,7 +94,10 @@ EBT_ARGS=" \
     --ebt-fp32 \
     --ebt-use-mask-token \
     --ebt-pred-rmsnorm \
+    --ebt-weight-tie \
     "
+    # --ebt-fp32 \
+    # --ebt-truncate-mcmc \
 
 GPT_ARGS=" \
     --num-layers $NLAYERS \
@@ -116,6 +119,7 @@ GPT_ARGS=" \
     $OPTIMIZER_ARGS \
     $EBT_ARGS \
     "
+    # --bf16 \
 
 OUTPUT_ARGS=" \
     --log-interval $LOG_INTERVAL \
@@ -146,6 +150,7 @@ ZERO_STAGE=0
 mkdir -p ds_configs
 DS_CONFIG_PATH="ds_configs/$VARIANT.json"
 
+# bf16 enabled : true
 cat <<EOF > $DS_CONFIG_PATH
 {
     "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,

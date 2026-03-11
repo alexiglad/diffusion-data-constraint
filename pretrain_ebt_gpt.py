@@ -217,10 +217,6 @@ def ebt_mcmc_step(model_module, predicted_logits, real_embeddings, masked_indice
     else:
         predicted_logits_noisy = predicted_logits
 
-    # Optional RMSNorm on predictions (all but final step)
-    if model_module.pred_rmsnorm is not None: #TODO possibly add and not is_final_step clause as well?
-        predicted_logits_noisy = model_module.pred_rmsnorm(predicted_logits_noisy)
-
     # Convert logits to embeddings
     # In hybrid mode (bf16 + fp32 MCMC), disable autocast so energy computation
     # runs in fp32 — required for second-order gradients via create_graph=True
@@ -258,6 +254,10 @@ def ebt_mcmc_step(model_module, predicted_logits, real_embeddings, masked_indice
     # Gradient descent step
     updated_logits = predicted_logits - alpha * grad
 
+    # Normalize output state to prevent logit norm drift across steps.
+    if model_module.pred_rmsnorm is not None:
+        updated_logits = model_module.pred_rmsnorm(updated_logits)
+
     return updated_logits, energies
 
 
@@ -281,10 +281,6 @@ def ebt_mcmc_step_embed(model_module, predicted_embeds, real_embeddings, masked_
         predicted_embeds_noisy = predicted_embeds + torch.randn_like(predicted_embeds) * args.ebt_langevin_noise
     else:
         predicted_embeds_noisy = predicted_embeds
-
-    # Optional RMSNorm on predictions
-    if model_module.pred_rmsnorm is not None and not is_final_step:
-        predicted_embeds_noisy = model_module.pred_rmsnorm(predicted_embeds_noisy)
 
     use_hybrid = args.bf16 and not args.ebt_fp32
     ctx = torch.amp.autocast('cuda', enabled=False) if use_hybrid else nullcontext()
@@ -311,6 +307,12 @@ def ebt_mcmc_step_embed(model_module, predicted_embeds, real_embeddings, masked_
 
     # Gradient descent step
     updated_embeds = predicted_embeds - alpha * grad
+
+    # Normalize the output state so embedding norms stay bounded across steps.
+    # This prevents norm drift: without this, each step's update compounds in
+    # raw embedding space, eventually producing large logits and loss divergence.
+    if model_module.pred_rmsnorm is not None:
+        updated_embeds = model_module.pred_rmsnorm(updated_embeds)
 
     return updated_embeds, energies
 
