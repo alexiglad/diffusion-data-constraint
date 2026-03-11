@@ -17,10 +17,10 @@ conda activate data_eff
 
 export MASTER_PORT=$((RANDOM%16384+49152))
 
-# Model size sweep: 20M, 90M, 106M
+# Model size sweep: 74M, 90M, 106M
 source utils/model_params.sh
 case $SLURM_ARRAY_TASK_ID in
-    0) MODEL_PARAM=("${PARAM_20M[@]}") ; SIZE=20M ;;
+    0) MODEL_PARAM=("${PARAM_74M[@]}") ; SIZE=74M ;;
     1) MODEL_PARAM=("${PARAM_90M[@]}") ; SIZE=90M ;;
     2) MODEL_PARAM=("${PARAM_106M[@]}") ; SIZE=106M ;;
 esac

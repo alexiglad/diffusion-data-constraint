@@ -236,6 +236,10 @@ def ebt_mcmc_step(model_module, predicted_logits, real_embeddings, masked_indice
 
         # Merge: real embeddings for unmasked, predicted for masked
         if use_hybrid:
+            # Cast both to fp32 so forward_energy runs entirely in fp32.
+            # logits_to_embeddings returns the weight dtype (bf16) internally,
+            # so we need an explicit cast here to avoid a bf16/fp32 mismatch in torch.where.
+            pred_embeddings = pred_embeddings.float()
             real_embeddings_cast = real_embeddings.float()
         else:
             real_embeddings_cast = real_embeddings
@@ -385,10 +389,15 @@ def forward_step(data_iterator, model):
                     model_module, predicted_embeds, real_embeddings, masked_indices,
                     position_ids, attention_mask, alpha, step_idx, num_steps, args)
 
-        # Map refined embeddings to logits via embed_to_vocab.
-        # Cast to weight dtype first (handles bf16 hybrid mode), then back to fp32.
-        embed_dtype = model_module.embed_to_vocab.weight.dtype
-        predicted_logits = model_module.embed_to_vocab(predicted_embeds.to(embed_dtype)).float()
+        # Map refined embeddings to logits.
+        # Weight-tied: F.linear(x, word_emb.weight) = x @ word_emb.weight.T = x @ [V,H].T → [B,S,V]
+        # Untied: embed_to_vocab linear layer with its own parameters.
+        if model_module.ebt_weight_tie:
+            word_emb = model_module.get_word_embeddings()
+            predicted_logits = F.linear(predicted_embeds.to(word_emb.dtype), word_emb).float()
+        else:
+            embed_dtype = model_module.embed_to_vocab.weight.dtype
+            predicted_logits = model_module.embed_to_vocab(predicted_embeds.to(embed_dtype)).float()
     else:
         # === Logit-space MCMC mode (original) ===
         predicted_logits = torch.randn(

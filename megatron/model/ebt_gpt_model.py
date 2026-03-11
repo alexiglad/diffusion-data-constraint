@@ -66,18 +66,21 @@ class EBTGPTModel(MegatronModule):
         self.energy_head = nn.Linear(args.hidden_size, 1, bias=False)
         nn.init.xavier_uniform_(self.energy_head.weight)
 
+        self.ebt_weight_tie = getattr(args, 'ebt_weight_tie', False)
+
         # Vocab-to-embed: maps predicted logits (vocab_size) to embedding space
         vocab_size = args.padded_vocab_size
-        if args.ebt_vocab_to_embed_method == 'linear':
+        if args.ebt_vocab_to_embed_method == 'linear' and not self.ebt_weight_tie:
             self.vocab_to_embed = nn.Linear(vocab_size, args.hidden_size, bias=False)
             nn.init.xavier_uniform_(self.vocab_to_embed.weight)
         else:
-            # weighted_sum: use softmax(logits) @ word_embeddings
+            # weighted_sum mode, or weight-tied (uses word_emb.weight directly)
             self.vocab_to_embed = None
 
         # Embed-to-vocab: maps refined embeddings back to logit space
         # Used when --ebt-use-mask-token (MCMC in embedding space)
-        if args.ebt_use_mask_token:
+        # When weight-tied, no separate parameter — uses word_emb.weight directly.
+        if args.ebt_use_mask_token and not self.ebt_weight_tie:
             self.embed_to_vocab = nn.Linear(args.hidden_size, vocab_size, bias=False)
             nn.init.xavier_uniform_(self.embed_to_vocab.weight)
         else:
@@ -173,7 +176,8 @@ class EBTGPTModel(MegatronModule):
             # Linear projection — cast to match weight dtype
             return self.vocab_to_embed(probs.to(self.vocab_to_embed.weight.dtype))
         else:
-            # Weighted sum: probs @ word_embeddings
+            # Weight-tied or weighted_sum: probs @ word_embeddings
+            # Both paths are equivalent: matmul(probs, W) where W=[vocab, hidden]
             word_emb = self.get_word_embeddings()  # [vocab, hidden]
             return torch.matmul(probs.to(word_emb.dtype), word_emb)
 

@@ -597,6 +597,10 @@ def _add_extra_args(parser):
                        help='Initialize MCMC from mask token embeddings instead of random '
                        'logits. MCMC refines in embedding space, then a linear layer '
                        'maps refined embeddings to logits for the loss.')
+    group.add_argument('--ebt-weight-tie', action='store_true', default=False,
+                       help='Tie projection weights to word embeddings. In mask-token mode, '
+                       'embed_to_vocab uses word_emb.weight. In logit mode, vocab_to_embed '
+                       'uses word_emb.weight (no separate parameter created).')
     return parser
 
 def _add_transformer_engine_args(parser):
